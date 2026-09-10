@@ -1,0 +1,94 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: #f5f6f8;
+  color: #1a1a1a;
+}
+
+.app {
+  max-width: 480px;
+  margin: 48px auto;
+  padding: 32px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+h1 {
+  font-size: 1.4rem;
+  margin-bottom: 24px;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #444;
+}
+
+select,
+input {
+  padding: 10px;
+  border: 1px solid #d0d3d9;
+  border-radius: 8px;
+  font-size: 1rem;
+}
+
+button {
+  margin-top: 8px;
+  padding: 12px;
+  border: none;
+  border-radius: 8px;
+  background: #2f6feb;
+  color: #fff;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:disabled {
+  background: #9db6ea;
+  cursor: not-allowed;
+}
+
+.result {
+  margin-top: 24px;
+  padding: 16px;
+  border-radius: 8px;
+  font-size: 0.95rem;
+}
+
+.result h2 {
+  margin: 0 0 8px;
+  font-size: 1.1rem;
+}
+
+.result-confirmed {
+  background: #e6f6ec;
+  border: 1px solid #34a853;
+  color: #1e7e34;
+}
+
+.result-rejected {
+  background: #fdeaea;
+  border: 1px solid #e0433c;
+  color: #b32d27;
+}
+
+.result-error {
+  background: #fdeaea;
+  border: 1px solid #e0433c;
+  color: #b32d27;
+}
