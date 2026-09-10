@@ -69,10 +69,8 @@ allow-list.
 `POST /api/orders`
 
 ```jsonc
-// request
 { "productId": "P100", "quantity": 2 }
 
-// response
 {
   "status": "CONFIRMED",
   "reason": null,
@@ -85,8 +83,9 @@ small read-only additions (not required by the spec) that let the frontend
 dropdown show live stock instead of hardcoded numbers.
 
 ## 5. Network tab evidence
-
-_Screenshots go here — replace this section with your own captures._
+![alt text](USBHub.png)
+![alt text](MechanicalKeyboard.png)
+![alt text](WirelessMouse.png)
 
 - **Confirmed order:** request a quantity within stock (e.g. 2× P100).
   Screenshot the DevTools Network tab showing the `POST /api/orders`
