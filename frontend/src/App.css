@@ -10,69 +10,141 @@ body {
 }
 
 .app {
-  max-width: 480px;
-  margin: 48px auto;
-  padding: 32px;
-  background: #fff;
-  border-radius: 12px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  max-width: 720px;
+  margin: 32px auto 64px;
+  padding: 0 16px;
 }
 
 h1 {
-  font-size: 1.4rem;
+  font-size: 1.6rem;
   margin-bottom: 24px;
 }
 
-form {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
+.panel {
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  padding: 24px;
+  margin-bottom: 20px;
 }
 
-label {
+.panel h2 {
+  font-size: 1.1rem;
+  margin: 0 0 16px;
+}
+
+.cart-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 12px;
+}
+
+.cart-form label {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  font-size: 0.9rem;
+  font-size: 0.85rem;
   font-weight: 600;
   color: #444;
+  flex: 1;
+  min-width: 160px;
 }
 
 select,
 input {
-  padding: 10px;
+  padding: 9px;
   border: 1px solid #d0d3d9;
-  border-radius: 8px;
-  font-size: 1rem;
-}
-
-button {
-  margin-top: 8px;
-  padding: 12px;
-  border: none;
-  border-radius: 8px;
-  background: #2f6feb;
-  color: #fff;
-  font-size: 1rem;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-button:disabled {
-  background: #9db6ea;
-  cursor: not-allowed;
-}
-
-.result {
-  margin-top: 24px;
-  padding: 16px;
   border-radius: 8px;
   font-size: 0.95rem;
 }
 
-.result h2 {
+button {
+  padding: 9px 16px;
+  border: none;
+  border-radius: 8px;
+  background: #e5e7eb;
+  color: #1a1a1a;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button.primary {
+  background: #2f6feb;
+  color: #fff;
+  display: block;
+  width: 100%;
+  margin-top: 12px;
+  padding: 12px;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  color: #2f6feb;
+  font-weight: 600;
+  padding: 0 0 0 8px;
+  font-size: 0.85rem;
+}
+
+.cart-list {
+  list-style: none;
+  padding: 0;
   margin: 0 0 8px;
-  font-size: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cart-list li {
+  background: #f5f6f8;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+th, td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid #eee;
+}
+
+tr.low-stock {
+  background: #fdeaea;
+  color: #b32d27;
+  font-weight: 600;
+}
+
+.result {
+  margin-top: 16px;
+  padding: 14px;
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+
+.result h3 {
+  margin: 0 0 6px;
+  font-size: 1rem;
+}
+
+.result ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
 }
 
 .result-confirmed {
@@ -81,14 +153,87 @@ button:disabled {
   color: #1e7e34;
 }
 
-.result-rejected {
+.result-rejected,
+.result-error {
   background: #fdeaea;
   border: 1px solid #e0433c;
   color: #b32d27;
 }
 
-.result-error {
+.empty {
+  color: #888;
+  font-size: 0.9rem;
+}
+
+.order-history {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.order-row {
+  border: 1px solid #eee;
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+
+.order-row-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.9rem;
+}
+
+.badge {
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.badge-confirmed {
+  background: #e6f6ec;
+  color: #1e7e34;
+}
+
+.badge-rejected {
   background: #fdeaea;
-  border: 1px solid #e0433c;
   color: #b32d27;
+}
+
+.badge-cancelled {
+  background: #eee;
+  color: #666;
+}
+
+.order-reason {
+  margin: 6px 0 0;
+  font-size: 0.85rem;
+  color: #b32d27;
+}
+
+.order-items {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 0.85rem;
+  color: #444;
+}
+
+.notification-feed {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 0.88rem;
+}
+
+.notification-feed li {
+  background: #f5f6f8;
+  border-radius: 8px;
+  padding: 8px 12px;
 }

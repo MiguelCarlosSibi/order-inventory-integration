@@ -85,7 +85,7 @@ dropdown show live stock instead of hardcoded numbers.
 ## 5. Network tab evidence
 ![alt text](USBHub.png)
 ![alt text](MechanicalKeyboard.png)
-![alt text](WirelessMouse.png)
+![alt text](WirelessMouse.png)mvn spring-boot:run
 
 - **Confirmed order:** request a quantity within stock (e.g. 2× P100).
   Screenshot the DevTools Network tab showing the `POST /api/orders`

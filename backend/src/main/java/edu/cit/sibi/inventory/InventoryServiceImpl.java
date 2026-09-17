@@ -62,6 +62,40 @@ class InventoryServiceImpl implements InventoryService {
     }
 
     @Override
+    public ReservationResult checkAvailability(String productId, int quantity) {
+        Optional<Inventory> maybeInventory = inventoryRepository.findById(productId);
+
+        if (maybeInventory.isEmpty()) {
+            return new ReservationResult(false, "Product not found: " + productId, null);
+        }
+
+        Inventory inventory = maybeInventory.get();
+
+        if (quantity <= 0) {
+            return new ReservationResult(false, "Quantity must be greater than zero", toDto(inventory));
+        }
+
+        if (quantity > inventory.getStock()) {
+            String reason = "Insufficient stock for " + productId
+                    + ": requested " + quantity + ", available " + inventory.getStock();
+            return new ReservationResult(false, reason, toDto(inventory));
+        }
+
+        // Would succeed — but nothing is mutated here, unlike reserve().
+        return new ReservationResult(true, null, toDto(inventory));
+    }
+
+    @Override
+    @Transactional
+    public InventoryItem restock(String productId, int quantity) {
+        Inventory inventory = inventoryRepository.findById(productId)
+                .orElseThrow(() -> new NoSuchElementException("Product not found: " + productId));
+        inventory.setStock(inventory.getStock() + quantity);
+        Inventory saved = inventoryRepository.save(inventory);
+        return toDto(saved);
+    }
+
+    @Override
     public List<InventoryItem> getAllItems() {
         return inventoryRepository.findAll().stream()
                 .map(this::toDto)

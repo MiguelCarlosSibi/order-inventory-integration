@@ -28,6 +28,22 @@ public interface InventoryService {
      */
     ReservationResult reserve(String productId, int quantity);
 
+    /**
+     * Read-only version of reserve(): reports whether a reservation of this
+     * size WOULD succeed right now, without changing any stock. Used to
+     * validate every line item of a multi-item order up front, so an order
+     * can be rejected as a whole before anything is actually reserved.
+     */
+    ReservationResult checkAvailability(String productId, int quantity);
+
+    /**
+     * Returns previously-reserved stock to inventory (used by order
+     * cancellation). Throws NoSuchElementException if the product doesn't
+     * exist — that should never happen in practice since it only restocks
+     * products that were successfully reserved earlier.
+     */
+    InventoryItem restock(String productId, int quantity);
+
     /** Convenience read used by the frontend to populate the product list. */
     List<InventoryItem> getAllItems();
 }
