@@ -28,13 +28,21 @@ public class OrderItem {
     @Column(nullable = false)
     private Integer quantity;
 
+    // "OK" if this item was (or would have been) reservable; otherwise the
+    // specific rejection reason for THIS item. Persisted so order history
+    // can show the real per-item result instead of falling back to the
+    // order's overall status for every line item.
+    @Column(nullable = false, length = 255)
+    private String outcome;
+
     protected OrderItem() {
         // required by JPA
     }
 
-    public OrderItem(String productId, Integer quantity) {
+    public OrderItem(String productId, Integer quantity, String outcome) {
         this.productId = productId;
         this.quantity = quantity;
+        this.outcome = outcome;
     }
 
     public Long getOrderItemId() {
@@ -55,5 +63,9 @@ public class OrderItem {
 
     public Integer getQuantity() {
         return quantity;
+    }
+
+    public String getOutcome() {
+        return outcome;
     }
 }

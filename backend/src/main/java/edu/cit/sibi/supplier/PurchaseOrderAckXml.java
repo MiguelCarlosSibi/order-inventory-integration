@@ -1,0 +1,32 @@
+package edu.cit.sibi.supplier;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlProperty;
+import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlRootElement;
+
+/** 201 response body from POST /purchase-orders. */
+@JacksonXmlRootElement(localName = "PurchaseOrderAck")
+@JsonIgnoreProperties(ignoreUnknown = true)
+class PurchaseOrderAckXml {
+
+    @JacksonXmlProperty(localName = "PoNumber")
+    public String poNumber;
+
+    @JacksonXmlProperty(localName = "StatusCode")
+    public int statusCode;
+
+    @JacksonXmlProperty(localName = "SupplierSku")
+    public String supplierSku;
+
+    @JacksonXmlProperty(localName = "Qty")
+    public int qty;
+
+    @JacksonXmlProperty(localName = "Uom")
+    public String uom;
+
+    @JacksonXmlProperty(localName = "BuyerRef")
+    public String buyerRef;
+
+    @JacksonXmlProperty(localName = "CreatedAt")
+    public String createdAt;
+}

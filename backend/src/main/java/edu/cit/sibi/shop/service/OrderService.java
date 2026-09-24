@@ -87,7 +87,7 @@ public class OrderService {
             // result.success() is expected true here since we just validated
             // it — but if a concurrent request changed stock in between,
             // this could still fail. Not resolved in this lab; see README.
-            order.addItem(new OrderItem(item.productId(), item.quantity()));
+            order.addItem(new OrderItem(item.productId(), item.quantity(), "OK"));
             itemResults.add(new OrderItemResult(item.productId(), item.quantity(), "OK"));
             updatedInventory.add(result.item());
 
@@ -115,7 +115,7 @@ public class OrderService {
             if (!check.success() && firstFailureReason == null) {
                 firstFailureReason = check.reason();
             }
-            order.addItem(new OrderItem(item.productId(), item.quantity()));
+            order.addItem(new OrderItem(item.productId(), item.quantity(), outcome));
             itemResults.add(new OrderItemResult(item.productId(), item.quantity(), outcome));
             if (check.item() != null) {
                 snapshot.add(check.item());
@@ -162,7 +162,7 @@ public class OrderService {
 
     private OrderSummary toSummary(Order order) {
         List<OrderItemResult> items = order.getItems().stream()
-                .map(i -> new OrderItemResult(i.getProductId(), i.getQuantity(), order.getStatus().name()))
+                .map(i -> new OrderItemResult(i.getProductId(), i.getQuantity(), i.getOutcome()))
                 .toList();
         return new OrderSummary(order.getOrderId(), order.getStatus().name(), order.getReason(), order.getCreatedAt(), items);
     }
