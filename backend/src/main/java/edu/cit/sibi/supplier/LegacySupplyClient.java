@@ -16,6 +16,7 @@ import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -159,6 +160,7 @@ class LegacySupplyClient {
      */
     private <T> T withSession(SessionCall<T> call) {
         return retryExecutor.withRetry("legacysupply-call", () -> {
+            awaitHeartbeat();   // before EVERY attempt: a retry can start many seconds after the first try
             ensureSession();
             try {
                 return call.call(sessionToken.get());
@@ -169,6 +171,29 @@ class LegacySupplyClient {
                 return call.call(sessionToken.get());
             }
         });
+    }
+
+    private static final Duration HEARTBEAT_MAX_AGE = Duration.ofSeconds(12);
+    private static final Duration HEARTBEAT_MAX_WAIT = Duration.ofSeconds(5);
+
+    /**
+     * Every call carries our instance id, so Tiangge must already have heard a recent heartbeat from
+     * this instance. At startup the supplier jobs can fire before the first heartbeat: wait briefly
+     * for it, and if it does not come, treat the call as transient (jobs retry on their next run).
+     */
+    private void awaitHeartbeat() {
+        long deadline = System.nanoTime() + HEARTBEAT_MAX_WAIT.toNanos();
+        while (!clientInstance.hasRecentHeartbeat(HEARTBEAT_MAX_AGE)) {
+            if (System.nanoTime() >= deadline) {
+                throw new LegacySupplyUnavailableException("No recent Tiangge heartbeat yet; holding this LegacySupply call");
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new LegacySupplyUnavailableException("Interrupted while waiting for a heartbeat", e);
+            }
+        }
     }
 
     private void ensureSession() {

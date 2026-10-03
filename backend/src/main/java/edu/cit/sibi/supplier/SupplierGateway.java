@@ -64,4 +64,21 @@ public interface SupplierGateway {
      * against a stale "restock on the way" would be wrong.
      */
     boolean deliveriesUpToDate();
+
+    /** Units that purchase orders LegacySupply has already accepted (not yet delivered) will bring in. */
+    int inboundUnits(String productId);
+
+    /**
+     * Makes sure open purchase orders will bring in at least minInboundUnits in total, placing an
+     * extra reorder for the difference if they will not.
+     * @return true if a real purchase order is now on its way
+     */
+    boolean ensureSupply(String productId, int minInboundUnits);
+
+    /**
+     * Re-checks, right now, the purchase orders still on their way for this product, so a delivery
+     * that already happened at LegacySupply is restocked before anyone relies on a stale "on the way".
+     * Rate-limited per product and never throws: a failed check just leaves the saved statuses as they are.
+     */
+    void refreshInbound(String productId);
 }

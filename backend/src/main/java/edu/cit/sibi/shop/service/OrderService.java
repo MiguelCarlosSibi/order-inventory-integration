@@ -28,6 +28,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Predicate;
+import java.util.function.ToIntFunction;
 
 /**
  * Order logic. Knows nothing about any sales channel: orders from the React
@@ -64,13 +65,22 @@ public class OrderService {
      * If every short product does, the order becomes BACKORDERED, not REJECTED.
      */
     public OrderResponse placeOrder(List<OrderItemRequest> items, Predicate<String> restockComing) {
+        return placeOrder(items, restockComing, productId -> 0);
+    }
+
+    /**
+     * promisedUnits says how many units of a product earlier BACKORDERED orders are already waiting
+     * for. Those units are not free for this order, even if they are physically in stock.
+     */
+    public OrderResponse placeOrder(List<OrderItemRequest> items, Predicate<String> restockComing,
+                                    ToIntFunction<String> promisedUnits) {
         if (TransactionSynchronizationManager.isActualTransactionActive()) {
             // The caller owns the transaction and its retry; join it.
-            return doPlaceOrder(items, restockComing);
+            return doPlaceOrder(items, restockComing, promisedUnits);
         }
         for (int attempt = 1; ; attempt++) {
             try {
-                return tx.execute(status -> doPlaceOrder(items, restockComing));
+                return tx.execute(status -> doPlaceOrder(items, restockComing, promisedUnits));
             } catch (StockChangedException e) {
                 // Stock moved between check and reserve; the transaction rolled back.
                 // Retrying re-checks stock, so it ends in a proper accept or reject.
@@ -81,12 +91,14 @@ public class OrderService {
         }
     }
 
-    private OrderResponse doPlaceOrder(List<OrderItemRequest> requestedItems, Predicate<String> restockComing) {
+    private OrderResponse doPlaceOrder(List<OrderItemRequest> requestedItems, Predicate<String> restockComing,
+                                        ToIntFunction<String> promisedUnits) {
         Map<String, ReservationResult> checks = new LinkedHashMap<>();
         boolean allOk = true;
         boolean canBackorder = true;
         for (OrderItemRequest item : requestedItems) {
-            ReservationResult check = inventoryService.checkAvailability(item.productId(), item.quantity());
+            int promised = item.quantity() > 0 ? promisedUnits.applyAsInt(item.productId()) : 0;
+            ReservationResult check = inventoryService.checkAvailability(item.productId(), item.quantity() + promised);
             checks.put(item.productId(), check);
             if (!check.success()) {
                 allOk = false;

@@ -2,10 +2,12 @@ package edu.cit.sibi.channel;
 
 import edu.cit.sibi.channel.ChannelStore.ChannelOrder;
 import edu.cit.sibi.inventory.InventoryService;
+import edu.cit.sibi.inventory.dto.ReservationResult;
 import edu.cit.sibi.shop.dto.OrderItemRequest;
 import edu.cit.sibi.shop.dto.OrderResponse;
 import edu.cit.sibi.shop.exception.OrderAlreadyCancelledException;
 import edu.cit.sibi.shop.exception.StockChangedException;
+import edu.cit.sibi.shop.model.OrderStatus;
 import edu.cit.sibi.shop.service.OrderService;
 import edu.cit.sibi.supplier.SupplierGateway;
 import org.slf4j.Logger;
@@ -14,20 +16,23 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.HttpClientErrorException;
-import edu.cit.sibi.inventory.dto.ReservationResult;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
-import java.util.ArrayList;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 /**
  * Tasks 4 and 5: polls the Tiangge feed, turns each order into exactly one
@@ -42,15 +47,20 @@ class FeedPoller {
 
     /** Same rule as the Lab 3 low-stock policy: restock up to twice the threshold (5). */
     private static final int RESTOCK_TARGET = 10;
-    // 8, not 4: during a flash sale / hands-off test, Tiangge places orders
-    // faster than usual while external calls (decide, ensureRestock) can
-    // each take seconds under slow/degraded conditions - more headroom
-    // here is what keeps later-queued events inside the 60s decision budget.
+
+    // 8 workers: during a flash sale, external calls can each take seconds, and more headroom
+    // keeps later-queued events inside the 60 s decision budget.
     private final ExecutorService pool = Executors.newFixedThreadPool(8, r -> {
         Thread t = new Thread(r, "feed-worker");
         t.setDaemon(true);
         return t;
     });
+
+    /**
+     * Held only while an order is checked against stock/promised units and committed (milliseconds),
+     * so two orders can never count the same incoming units. Never held during a supplier or Tiangge call.
+     */
+    private final ReentrantLock placeLock = new ReentrantLock();
 
     private final TiangeClient client;
     private final ChannelStore store;
@@ -59,7 +69,6 @@ class FeedPoller {
     private final SupplierGateway supplier;
     private final StockSyncListener stockSync;
     private final TransactionTemplate tx;
-    private final Instant startedAt = Instant.now();
 
     FeedPoller(TiangeClient client, ChannelStore store, OrderService orderService, InventoryService inventory,
                SupplierGateway supplier, StockSyncListener stockSync, TransactionTemplate tx) {
@@ -72,11 +81,21 @@ class FeedPoller {
         this.tx = tx;
     }
 
+    private final Instant startedAt = Instant.now();
+
+    /**
+     * After a restart our saved purchase-order statuses can be stale (LegacySupply keeps delivering
+     * while we are off). Deciding an order against a stale "restock on the way" would backorder it
+     * with no open purchase order behind it, so wait for the first full status refresh. The wait is
+     * capped, so an unreachable supplier can never freeze order handling (60 s decision deadline).
+     */
+    private boolean supplierStatusesFresh() {
+        return supplier.deliveriesUpToDate() || Duration.between(startedAt, Instant.now()).toSeconds() > 20;
+    }
+
     @Scheduled(fixedDelay = 2000, initialDelay = 3000)
     void poll() {
-        // After a restart, wait until our purchase-order statuses are fresh (but never longer than
-        // 30 s), so we don't backorder against a purchase order that was delivered while we were off.
-        if (!supplier.deliveriesUpToDate() && Duration.between(startedAt, Instant.now()).toSeconds() < 30) {
+        if (!supplierStatusesFresh()) {
             return;
         }
         try {
@@ -166,13 +185,7 @@ class FeedPoller {
     private void ensureRestocks(List<OrderItemRequest> items) {
         for (OrderItemRequest item : items) {
             try {
-                int stock = inventory.getItem(item.productId()).stock();
-                if (stock < item.quantity()) {
-                    int units = Math.max(RESTOCK_TARGET, item.quantity()) - stock;
-                    boolean onTheWay = supplier.ensureRestock(item.productId(), units);
-                    log.info("Short on {} (have {}, need {}): restock on the way = {}",
-                            item.productId(), stock, item.quantity(), onTheWay);
-                }
+                ensureSupplyFor(item);
             } catch (NoSuchElementException unknownProduct) {
                 // Not our product: the order will be rejected.
             } catch (RuntimeException e) {
@@ -181,7 +194,6 @@ class FeedPoller {
         }
     }
 
-    /** The shop order and our record of the Tiangge order commit together, or not at all. */
     /** Thrown inside the transaction to undo a rejection that a restock could turn into a backorder. */
     private static final class RestockNeeded extends RuntimeException {
         final List<OrderItemRequest> shortLines;
@@ -197,8 +209,10 @@ class FeedPoller {
         for (int attempt = 1; ; attempt++) {
             final boolean lastTry = attempt >= 3;
             try {
-                return tx.execute(status -> {
-                    OrderResponse r = orderService.placeOrder(items, supplier::hasRestockOnTheWay);
+                placeLock.lock();
+                try {
+                    return tx.execute(status -> {
+                    OrderResponse r = orderService.placeOrder(items, restockCovers(items), store::backorderedUnits);
                     if (!lastTry && "REJECTED".equals(r.status())) {
                         List<OrderItemRequest> shortLines = shortLines(items);
                         if (shortLines != null) {
@@ -209,7 +223,10 @@ class FeedPoller {
                     }
                     store.insertOrder(ev.orderId(), r.orderId(), Instant.parse(ev.placedAt()), decisionOf(r.status()));
                     return r;
-                });
+                    });
+                } finally {
+                    placeLock.unlock();
+                }
             } catch (RestockNeeded e) {
                 restockFor(e.shortLines);
             } catch (StockChangedException e) {
@@ -235,16 +252,53 @@ class FeedPoller {
         return out;
     }
 
+    /**
+     * Makes sure incoming stock covers this order PLUS every backorder already waiting for the same
+     * product. Returns true if nothing was needed or a purchase order is on its way.
+     */
+    private boolean ensureSupplyFor(OrderItemRequest item) {
+        String pid = item.productId();
+        int stock = inventory.getItem(pid).stock();
+        int promised = store.backorderedUnits(pid);
+        if (stock - promised >= item.quantity()) {
+            return true;
+        }
+        // Our saved purchase-order statuses can lag LegacySupply by a poll interval: a delivery that
+        // already happened there would still look "on the way" here. Check live before relying on it.
+        supplier.refreshInbound(pid);
+        stock = inventory.getItem(pid).stock();
+        if (stock - promised >= item.quantity()) {
+            return true;
+        }
+        int needed = Math.max(Math.max(RESTOCK_TARGET, item.quantity()) - stock,
+                promised + item.quantity() - stock);
+        boolean onTheWay = supplier.ensureSupply(pid, needed);
+        log.info("Short on {} (have {}, {} promised to backorders, need {}): inbound target {} units, restock on the way = {}",
+                pid, stock, promised, item.quantity(), needed, onTheWay);
+        return onTheWay;
+    }
+
+    /**
+     * An order may only be BACKORDERED if stock + units already on the way, minus what earlier
+     * backorders are waiting for, still covers it. Otherwise we would promise stock we will not have.
+     */
+    private Predicate<String> restockCovers(List<OrderItemRequest> items) {
+        return productId -> {
+            try {
+                int wanted = items.stream().filter(i -> i.productId().equals(productId))
+                        .mapToInt(OrderItemRequest::quantity).sum();
+                int stock = inventory.getItem(productId).stock();
+                return stock + supplier.inboundUnits(productId) - store.backorderedUnits(productId) >= wanted;
+            } catch (RuntimeException e) {
+                return false;
+            }
+        };
+    }
+
     private void restockFor(List<OrderItemRequest> lines) {
         for (OrderItemRequest item : lines) {
             try {
-                int stock = inventory.getItem(item.productId()).stock();
-                int units = Math.max(RESTOCK_TARGET, item.quantity()) - stock;
-                if (units > 0) {
-                    boolean onTheWay = supplier.ensureRestock(item.productId(), units);
-                    log.info("Stock for {} ran out while deciding (have {}, need {}): restock on the way = {}",
-                            item.productId(), stock, item.quantity(), onTheWay);
-                }
+                ensureSupplyFor(item);
             } catch (RuntimeException e) {
                 log.warn("Could not order restock for {}: {}", item.productId(), e.getMessage());
             }
@@ -265,35 +319,110 @@ class FeedPoller {
         }
     }
 
+    /** Just before a BACKORDERED decision goes out, make sure a purchase order really is coming. */
+    private ChannelOrder revalidated(ChannelOrder co) {
+        if (!"BACKORDERED".equals(co.decision())) {
+            return co;
+        }
+        String tid = co.tianggeOrderId();
+        try {
+            Map<String, Integer> need = orderService.requiredUnits(co.shopOrderId());
+            for (String product : need.keySet()) {
+                supplier.refreshInbound(product);   // never judge "restock on the way" from a stale status
+            }
+            List<String> shorts = new ArrayList<>(orderService.shortProducts(co.shopOrderId()));
+            // Stock that is physically here but owed to OLDER backorders is not ours to take: this
+            // order stays BACKORDERED instead of jumping the queue.
+            for (Map.Entry<String, Integer> line : need.entrySet()) {
+                if (!shorts.contains(line.getKey())
+                        && inventory.getItem(line.getKey()).stock()
+                                - store.backorderedUnitsBefore(line.getKey(), co.shopOrderId()) < line.getValue()) {
+                    shorts.add(line.getKey());
+                }
+            }
+            if (shorts.isEmpty()) {
+                // The stock arrived since placement and nobody older is waiting for it. Never accept
+                // from stock Tiangge has not been SENT yet: that acceptance would be an oversold order.
+                // Stay BACKORDERED instead; BackorderResolver accepts it once Tiangge has the figure.
+                if (!stockSync.awaitPublishedAtLeast(need, 6000)) {
+                    log.info("Backorder {}: Tiangge has not been sent our delivered stock yet, not accepting it now", tid);
+                    return co;
+                }
+                if (orderService.fulfilBackorder(co.shopOrderId()) == OrderStatus.CONFIRMED) {
+                    store.changeDecision(tid, "ACCEPTED");
+                    return store.find(tid).orElseThrow();
+                }
+                return co;
+            }
+            for (String product : shorts) {
+                if (!supplier.hasRestockOnTheWay(product)) {
+                    int owed = store.backorderedUnitsBefore(product, co.shopOrderId());
+                    int wanted = need.getOrDefault(product, 1);
+                    int stock = inventory.getItem(product).stock();
+                    supplier.ensureSupply(product, Math.max(Math.max(RESTOCK_TARGET, wanted), owed + wanted - stock));
+                    if (!supplier.hasRestockOnTheWay(product)) {
+                        if (Duration.between(co.placedAt(), Instant.now()).toSeconds() > 30) {
+                            return co;   // do not risk the 60 s deadline
+                        }
+                        log.warn("Backorder {}: no restock on the way for {} yet, holding the decision", tid, product);
+                        return null;
+                    }
+                }
+            }
+            return co;
+        } catch (RuntimeException e) {
+            log.warn("Could not re-check backorder {} before deciding: {}", tid, e.getMessage());
+            return null;
+        }
+    }
+
     /** Safe to repeat: Tiangge returns the order unchanged for the same decision and shopOrderId. */
     private boolean sendDecision(String tid) {
-        ChannelOrder co = store.find(tid).orElseThrow();
-        if (co.decisionSent()) {
+        ChannelOrder current = store.find(tid).orElseThrow();
+        if (current.decisionSent()) {
             return true;
         }
+        final ChannelOrder co = revalidated(current);
+        if (co == null) {
+            return false;   // not safe to announce yet; retried on the next poll
+        }
         try {
-            client.decide(tid, co.decision(), "SO-" + co.shopOrderId(), null);
+            // Delivering the decision and recording "decision sent" happen together, in strict order
+            // with stock updates (see StockSyncListener#sendInOrder).
+            Supplier<Object> deliver = () -> {
+                try {
+                    client.decide(tid, co.decision(), "SO-" + co.shopOrderId(), null);
+                } catch (HttpClientErrorException e) {
+                    if (e.getStatusCode().value() != 409) {
+                        throw e;
+                    }
+                    log.warn("Tiangge already holds a different decision for {}", tid);
+                }
+                store.markDecisionSent(tid);
+                return null;
+            };
+            if ("ACCEPTED".equals(co.decision())) {
+                // Exclusive of stock figures for these products, and only if Tiangge's own view covers it.
+                stockSync.sendAcceptance(tid, orderService.requiredUnits(co.shopOrderId()), deliver);
+            } else {
+                stockSync.sendInOrder(deliver);
+            }
         } catch (HttpClientErrorException e) {
             if (e.getStatusCode().value() == 404) {
                 abandonUnknown(co);   // Tiangge no longer has this order: stop retrying it for ever
                 return false;
             }
-            if (e.getStatusCode().value() != 409) {
-                log.error("Tiangge refused the decision for {}: {}", tid, e.getResponseBodyAsString());
-                return false;
-            }
-            log.warn("Tiangge already holds a different decision for {}", tid);
+            log.error("Tiangge refused the decision for {}: {}", tid, e.getResponseBodyAsString());
+            return false;
         } catch (RuntimeException e) {
             log.warn("Decision for {} not delivered yet, will retry: {}", tid, e.getMessage());
             return false;
         }
-        store.markDecisionSent(tid);
         long seconds = Duration.between(co.placedAt(), Instant.now()).toSeconds();
         log.info("Decided {} as {} (shop order {}) {} s after placement{}", tid, co.decision(),
                 co.shopOrderId(), seconds, seconds > 60 ? "  *** LATE ***" : "");
         if ("ACCEPTED".equals(co.decision())) {
-            // Tiangge has the decision now: show the reduced stock for exactly the products on this order.
-            stockSync.publishProducts(store.productsOf(co.shopOrderId()));
+            stockSync.publishAll();   // Tiangge has the decision now: show the reduced stock
         }
         return true;
     }
@@ -312,6 +441,7 @@ class FeedPoller {
         store.markDecisionSent(tid);
         store.markResolved(tid);
         store.markCancelConfirmed(tid);
+        stockSync.clearAmbiguous(tid);
         log.warn("Tiangge no longer knows order {}: cancelled shop order {} and closed it", tid, co.shopOrderId());
     }
 
@@ -333,22 +463,45 @@ class FeedPoller {
             sendDecision(tid);
         }
 
+        // The manual: confirm FIRST, then publish the restocked figure. The restock below would
+        // publish on its own the moment it commits, so hold stock for these products until confirmed.
+        Set<String> heldProducts = new java.util.HashSet<>();
+        try {
+            heldProducts.addAll(orderService.requiredUnits(co.shopOrderId()).keySet());
+        } catch (RuntimeException ignored) {
+            // unknown order: cancelOrder below reports it
+        }
+        stockSync.holdPublishing(heldProducts);
         try {
             try {
-                // Restocks Inventory, which publishes the new stock on its own
-                // via InventoryChangedEvent the moment this commits - independent
-                // of whether the confirmation call below succeeds.
+                // Restocks Inventory (its InventoryChangedEvent is held back until the confirmation is done).
                 orderService.cancelOrder(co.shopOrderId());
             } catch (OrderAlreadyCancelledException alreadyDone) {
                 // a retry after a failed confirmation: the restock already happened
             }
-            client.confirmCancellation(tid);
-            store.markCancelConfirmed(tid);
-            long seconds = Duration.between(Instant.parse(ev.cancelledAt()), Instant.now()).toSeconds();
-            log.info("Cancellation of {} confirmed {} s after the customer cancelled", tid, seconds);
-            stockSync.publishProducts(store.productsOf(co.shopOrderId()));   // the manual: confirm first, THEN publish the restocked figure
-        } catch (HttpClientErrorException e) {
-            log.error("Tiangge refused the cancellation confirmation for {}: {}", tid, e.getResponseBodyAsString());
+            boolean settled = false;
+            try {
+                client.confirmCancellation(tid);
+                settled = true;
+            } catch (HttpClientErrorException e) {
+                int code = e.getStatusCode().value();
+                if (code == 409 || code == 404) {
+                    settled = true;   // e.g. a timed-out first attempt that Tiangge did process
+                    log.warn("Tiangge answered {} to the cancellation confirmation of {}; treating it as settled: {}",
+                            code, tid, e.getResponseBodyAsString());
+                } else {
+                    log.error("Tiangge refused the cancellation confirmation for {}: {}", tid, e.getResponseBodyAsString());
+                }
+            }
+            if (settled) {
+                store.markCancelConfirmed(tid);
+                long seconds = Duration.between(Instant.parse(ev.cancelledAt()), Instant.now()).toSeconds();
+                log.info("Cancellation of {} confirmed {} s after the customer cancelled", tid, seconds);
+            }
+        } finally {
+            // Runs on EVERY path: release the hold, then publish the restocked figure.
+            stockSync.releasePublishing(heldProducts);
+            stockSync.publishAll();
         }
     }
 }

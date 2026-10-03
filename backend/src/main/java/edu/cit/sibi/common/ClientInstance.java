@@ -2,6 +2,7 @@ package edu.cit.sibi.common;
 
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -26,5 +27,18 @@ public class ClientInstance {
 
     public Instant startedAt() {
         return startedAt;
+    }
+
+    private volatile Instant lastHeartbeatOk;
+
+    /** Called by the Tiangge client each time Tiangge accepts a heartbeat from this instance. */
+    public void heartbeatAccepted() {
+        lastHeartbeatOk = Instant.now();
+    }
+
+    /** True if Tiangge has accepted a heartbeat from this instance within the given time. */
+    public boolean hasRecentHeartbeat(Duration maxAge) {
+        Instant t = lastHeartbeatOk;
+        return t != null && Duration.between(t, Instant.now()).compareTo(maxAge) < 0;
     }
 }

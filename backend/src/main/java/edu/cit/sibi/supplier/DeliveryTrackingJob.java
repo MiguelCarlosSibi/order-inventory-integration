@@ -7,6 +7,10 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Part E: polls open purchase orders, maps LegacySupply's StatusCode to our
@@ -32,6 +36,11 @@ class DeliveryTrackingJob {
     /** True once one full pass over the open purchase orders has completed since the app started. */
     private volatile boolean checkedSinceStart = false;
 
+    /** One status pass at a time, so a delivery is never published twice. */
+    private final ReentrantLock passLock = new ReentrantLock();
+    private static final long REFRESH_MIN_GAP_MILLIS = 2000;
+    private final Map<String, Long> lastRefresh = new ConcurrentHashMap<>();
+
     DeliveryTrackingJob(SupplierOrderRepository repository, LegacySupplyClient client,
                         ProductCatalogMapping catalogMapping, ApplicationEventPublisher eventPublisher) {
         this.repository = repository;
@@ -51,12 +60,56 @@ class DeliveryTrackingJob {
 
     @Scheduled(fixedDelayString = "${supplier.reorder.delivery-poll-interval-ms:30000}")
     void pollOpenOrders() {
-        List<SupplierOrder> open = repository.findByStatusIn(OPEN_STATUSES);
-        if (open.isEmpty()) {
-            checkedSinceStart = true;
+        passLock.lock();
+        try {
+            List<SupplierOrder> open = repository.findByStatusIn(OPEN_STATUSES);
+            if (open.isEmpty()) {
+                checkedSinceStart = true;
+                return;
+            }
+            log.info("Polling {} open supplier order(s)", open.size());
+            if (pollOrders(open)) {
+                checkedSinceStart = true;
+            }
+        } finally {
+            passLock.unlock();
+        }
+    }
+
+    /**
+     * Checks the open purchase orders of ONE product right now (our saved status can lag LegacySupply
+     * by a whole poll interval). At most once per product every couple of seconds, and it never waits
+     * long for a pass that is already running - that pass is doing the same work.
+     */
+    void refresh(String productId) {
+        long now = System.currentTimeMillis();
+        Long last = lastRefresh.get(productId);
+        if (last != null && now - last < REFRESH_MIN_GAP_MILLIS) {
             return;
         }
-        log.info("Polling {} open supplier order(s)", open.size());
+        boolean locked = false;
+        try {
+            locked = passLock.tryLock(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (!locked) {
+            return;
+        }
+        try {
+            lastRefresh.put(productId, System.currentTimeMillis());
+            List<SupplierOrder> open = repository.findByStatusIn(OPEN_STATUSES).stream()
+                    .filter(o -> o.getProductId().equals(productId)).toList();
+            if (!open.isEmpty()) {
+                pollOrders(open);
+            }
+        } finally {
+            passLock.unlock();
+        }
+    }
+
+    /** Must be called holding passLock. Returns true if every order could be checked. */
+    private boolean pollOrders(List<SupplierOrder> open) {
         boolean allChecked = true;
 
         for (SupplierOrder order : open) {
@@ -93,8 +146,6 @@ class DeliveryTrackingJob {
                 log.error("Order {} ({}) now permanently failed: {}", order.getBuyerRef(), order.getPoNumber(), e.getMessage());
             }
         }
-        if (allChecked) {
-            checkedSinceStart = true;
-        }
+        return allChecked;
     }
 }

@@ -115,6 +115,41 @@ class SupplierGatewayImpl implements SupplierGateway {
         return hasRestockOnTheWay(productId);
     }
 
+    @Override
+    public void refreshInbound(String productId) {
+        try {
+            deliveryTracking.refresh(productId);
+        } catch (RuntimeException e) {
+            log.warn("Could not refresh purchase orders for {}: {}", productId, e.getMessage());
+        }
+    }
+
+    @Override
+    public int inboundUnits(String productId) {
+        return unitsOf(productId, ON_THE_WAY);
+    }
+
+    @Override
+    public synchronized boolean ensureSupply(String productId, int minInboundUnits) {
+        boolean onTheWay = ensureRestock(productId, minInboundUnits);
+        if (!onTheWay) {
+            return false;
+        }
+        int planned = unitsOf(productId, OPEN_STATUSES);
+        if (planned < minInboundUnits) {
+            requestReorder(productId, minInboundUnits - planned);
+        }
+        return hasRestockOnTheWay(productId);
+    }
+
+    /** Units our purchase orders will really deliver: whole cases x pack size. */
+    private int unitsOf(String productId, List<SupplierOrderStatus> statuses) {
+        return repository.findByStatusIn(statuses).stream()
+                .filter(o -> o.getProductId().equals(productId))
+                .mapToInt(o -> catalogMapping.casesToUnits(productId, o.getCases()))
+                .sum();
+    }
+
     static SupplierOrderStatus mapStatus(int legacySupplyStatusCode) {
         return switch (legacySupplyStatusCode) {
             case 10 -> SupplierOrderStatus.ACCEPTED;

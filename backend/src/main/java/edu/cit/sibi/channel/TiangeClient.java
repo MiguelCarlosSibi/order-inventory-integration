@@ -14,12 +14,14 @@ import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 
+import java.time.Duration;
+import java.time.Instant;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 /**
  * Everything that actually talks to Tiangge over HTTP. Package-private on
- * purpose — same rule as LegacySupplyClient in edu.cit.sibi.supplier.
- * Nothing outside edu.cit.sibi.channel may reference this type.
+ * purpose. Nothing outside edu.cit.sibi.channel may reference this type.
  */
 @Component
 class TiangeClient {
@@ -30,22 +32,67 @@ class TiangeClient {
     private final String baseUrl;
     private final String clientId;
     private final String apiKey;
+    private final String appName;
     private final ClientInstance clientInstance;
+    private volatile Instant lastHeartbeatOk;
+    private final Object heartbeatLock = new Object();
 
     TiangeClient(RestTemplate tiangeRestTemplate,
                  @Value("${tiangge.base-url}") String baseUrl,
                  @Value("${tiangge.client-id}") String clientId,
                  @Value("${tiangge.api-key}") String apiKey,
+                 @Value("${tiangge.app-name:order-inventory-integration}") String appName,
                  ClientInstance clientInstance) {
         this.restTemplate = tiangeRestTemplate;
         this.baseUrl = baseUrl;
         this.clientId = clientId;
         this.apiKey = apiKey;
+        this.appName = appName;
         this.clientInstance = clientInstance;
     }
 
-    HeartbeatResponse sendHeartbeat(HeartbeatRequest request) {
-        return exchange(HttpMethod.POST, "/instances/heartbeat", request, HeartbeatResponse.class);
+    HeartbeatResponse sendHeartbeat() {
+        long uptimeSeconds = Duration.between(clientInstance.startedAt(), Instant.now()).toSeconds();
+        HeartbeatRequest request = new HeartbeatRequest(appName,
+                DateTimeFormatter.ISO_INSTANT.format(clientInstance.startedAt()), uptimeSeconds);
+        HeartbeatResponse response = exchange(HttpMethod.POST, "/instances/heartbeat", request, HeartbeatResponse.class);
+        lastHeartbeatOk = Instant.now();
+        clientInstance.heartbeatAccepted();
+        return response;
+    }
+
+    private boolean heartbeatFresherThan(Duration limit) {
+        Instant t = lastHeartbeatOk;
+        return t != null && Duration.between(t, Instant.now()).compareTo(limit) < 0;
+    }
+
+    /**
+     * How old our last accepted heartbeat may be when a call leaves. Deliberately well inside any
+     * plausible "recent" window on Tiangge's side (the heartbeat runs every 5 s).
+     */
+    private static final Duration HEARTBEAT_MAX_AGE = Duration.ofSeconds(12);
+
+    /**
+     * Never call Tiangge as an instance without a recent heartbeat: refresh it first, or hold the call.
+     * Checked before EVERY attempt, not once per request: retries can start many seconds later.
+     */
+    private void requireFreshHeartbeat() {
+        if (heartbeatFresherThan(HEARTBEAT_MAX_AGE)) {
+            return;
+        }
+        synchronized (heartbeatLock) {
+            if (heartbeatFresherThan(HEARTBEAT_MAX_AGE)) {
+                return;
+            }
+            try {
+                sendHeartbeat();
+            } catch (RuntimeException e) {
+                log.warn("Inline heartbeat failed: {}", e.getMessage());
+            }
+            if (!heartbeatFresherThan(HEARTBEAT_MAX_AGE)) {
+                throw new IllegalStateException("No recent heartbeat accepted by Tiangge yet; holding this call");
+            }
+        }
     }
 
     void publishListings(List<ListingDto> listings) {
@@ -63,11 +110,13 @@ class TiangeClient {
         return exchange(HttpMethod.GET, path, null, FeedResponse.class);
     }
 
+    /** One attempt only: StockSyncListener#sendInOrder does the retrying. */
     TiangeOrderView decide(String orderId, String decision, String shopOrderId, String reason) {
         return exchange(HttpMethod.POST, "/orders/" + orderId + "/decision",
                 new DecisionRequest(decision, shopOrderId, reason), TiangeOrderView.class, 1);
     }
 
+    /** One attempt only, same reason as decide(). */
     TiangeOrderView resolve(String orderId, String status) {
         return exchange(HttpMethod.POST, "/orders/" + orderId + "/resolution",
                 new ResolutionRequest(status), TiangeOrderView.class, 1);
@@ -82,18 +131,17 @@ class TiangeClient {
         return exchange(HttpMethod.GET, "/orders/" + orderId, null, TiangeOrderView.class);
     }
 
-    /**
-     * One call, with a short retry for exactly the failures the manual calls safe to retry
-     * (timeouts, 503 unavailable). 4xx errors are NOT retried: decision_conflict, not_backordered
-     * and not_cancelled are terminal outcomes the caller needs to see, not transient failures.
-     */
     private <T> T exchange(HttpMethod method, String path, Object body, Class<T> responseType) {
         return exchange(method, path, body, responseType, 3);
     }
 
     private <T> T exchange(HttpMethod method, String path, Object body, Class<T> responseType, int maxAttempts) {
+        boolean isHeartbeat = path.equals("/instances/heartbeat");
         RuntimeException lastError = null;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            if (!isHeartbeat) {
+                requireFreshHeartbeat();
+            }
             try {
                 HttpEntity<Object> entity = new HttpEntity<>(body, jsonHeaders());
                 return restTemplate.exchange(baseUrl + path, method, entity, responseType).getBody();
@@ -104,8 +152,7 @@ class TiangeClient {
                     sleep(attempt);
                 }
             } catch (HttpClientErrorException e) {
-                // 4xx: not retryable. Log and rethrow so the caller can decide
-                // (e.g. treat decision_conflict as "already handled").
+                // 4xx: not retryable. Log and rethrow so the caller can decide.
                 log.warn("Tiangge call {} {} rejected: {}", method, path, e.getResponseBodyAsString());
                 throw e;
             }

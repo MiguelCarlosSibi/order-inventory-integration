@@ -12,7 +12,9 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.HttpClientErrorException;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * Task 6: backordered orders wait for stock. When a LegacySupply delivery has
@@ -23,6 +25,8 @@ import java.util.Map;
 class BackorderResolver {
 
     private static final Logger log = LoggerFactory.getLogger(BackorderResolver.class);
+
+    private static final int RESTOCK_TARGET = 10;
 
     private final ChannelStore store;
     private final OrderService orderService;
@@ -53,26 +57,36 @@ class BackorderResolver {
         }
     }
 
-    /**
-     * Stock that fulfilBackorder()/cancelOrder() changes below is already
-     * published by InventoryChangedEvent the moment each commits -
-     * independent of whether the resolve() call to Tiangge afterward
-     * succeeds. (An earlier version held that publish until after
-     * client.resolve() succeeded and threw it away on any failure - the
-     * same bug fixed in FeedPoller, but worse here: there was no later
-     * sweep to catch what got dropped.)
-     */
     private void resolveOne(ChannelOrder co) {
         String tid = co.tianggeOrderId();
         String outcome;
-        // Tiangge must already know the delivered stock before we accept against it.
-        stockSync.awaitCaughtUp(6000);
+
+        // Our saved purchase-order statuses can lag LegacySupply: refresh the ones this order waits on.
+        for (String product : orderService.requiredUnits(co.shopOrderId()).keySet()) {
+            supplier.refreshInbound(product);
+        }
+
+        // About to accept this order from delivered stock: Tiangge must already have been SENT a figure
+        // big enough to cover it, otherwise the acceptance is an oversold order.
+        if (orderService.shortProducts(co.shopOrderId()).isEmpty()
+                && !stockSync.awaitPublishedAtLeast(orderService.requiredUnits(co.shopOrderId()), 6000)) {
+            log.info("Backorder {}: Tiangge has not confirmed our delivered stock yet, will try again", tid);
+            return;
+        }
+
         OrderStatus status = orderService.fulfilBackorder(co.shopOrderId());
         if (status == OrderStatus.CONFIRMED) {
             outcome = "ACCEPTED";
         } else if (status == OrderStatus.BACKORDERED) {
-            boolean stillComing = orderService.shortProducts(co.shopOrderId()).stream()
-                    .allMatch(supplier::hasRestockOnTheWay);
+            List<String> shorts = orderService.shortProducts(co.shopOrderId());
+            Map<String, Integer> need = orderService.requiredUnits(co.shopOrderId());
+            for (String product : shorts) {
+                if (!supplier.hasRestockOnTheWay(product)) {
+                    // every open backorder must have a purchase order coming for what it lacks
+                    supplier.ensureRestock(product, Math.max(RESTOCK_TARGET, need.getOrDefault(product, 1)));
+                }
+            }
+            boolean stillComing = shorts.stream().allMatch(supplier::hasRestockOnTheWay);
             if (stillComing) {
                 misses.remove(tid);
                 return;
@@ -85,23 +99,39 @@ class BackorderResolver {
         } else {
             outcome = "CANCELLED";
         }
+
+        final String finalOutcome = outcome;
         try {
-            client.resolve(tid, outcome);
+            // Resolution delivery + "resolved" flag together, in strict order with stock figures.
+            Supplier<Object> deliver = () -> {
+                try {
+                    client.resolve(tid, finalOutcome);
+                } catch (HttpClientErrorException e) {
+                    if (e.getStatusCode().value() != 409) {
+                        throw e;
+                    }
+                    log.info("Tiangge says {} is no longer backordered", tid);
+                }
+                store.markResolved(tid);
+                return null;
+            };
+            if ("ACCEPTED".equals(finalOutcome)) {
+                // Same protection as an ACCEPTED decision: exclusive of stock figures, covered by Tiangge's own view.
+                stockSync.sendAcceptance(tid, orderService.requiredUnits(co.shopOrderId()), deliver);
+            } else {
+                stockSync.sendInOrder(deliver);
+            }
         } catch (HttpClientErrorException e) {
             if (e.getStatusCode().value() == 404) {
                 abandonUnknown(co);   // Tiangge no longer has this order: stop retrying it for ever
                 return;
             }
-            if (e.getStatusCode().value() != 409) {
-                throw e;
-            }
-            log.info("Tiangge says {} is no longer backordered", tid);
+            throw e;
         }
-        store.markResolved(tid);
         misses.remove(tid);
         log.info("Backorder {} (shop order {}) resolved {}", tid, co.shopOrderId(), outcome);
         if ("ACCEPTED".equals(outcome)) {
-            stockSync.publishProducts(store.productsOf(co.shopOrderId()));   // resolution delivered: show the reduced stock
+            stockSync.publishAll();   // resolution delivered: show the reduced stock
         }
     }
 
@@ -119,6 +149,7 @@ class BackorderResolver {
         store.markDecisionSent(tid);
         store.markResolved(tid);
         store.markCancelConfirmed(tid);
+        stockSync.clearAmbiguous(tid);
         misses.remove(tid);
         log.warn("Tiangge no longer knows order {}: cancelled shop order {} and closed it", tid, co.shopOrderId());
     }

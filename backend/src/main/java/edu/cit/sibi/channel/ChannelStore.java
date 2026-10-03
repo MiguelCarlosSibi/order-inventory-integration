@@ -10,8 +10,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.HashSet;
+import java.util.Set;
 
 @Component
+@SuppressWarnings({"SqlResolve", "SqlNoDataSourceInspection"})
 class ChannelStore {
 
     record ChannelOrder(String tianggeOrderId, long shopOrderId, String decision, Instant placedAt,
@@ -75,6 +78,53 @@ class ChannelStore {
         jdbc.update("update channel_orders set decision_sent = true where tiangge_order_id = ?", id);
     }
 
+    /** Only before the decision has been sent: a backorder that was filled in the meantime becomes an acceptance. */
+    void changeDecision(String id, String decision) {
+        jdbc.update("update channel_orders set decision = ? where tiangge_order_id = ? and decision_sent = false",
+                decision, id);
+    }
+    /** Products that still have a reservation Tiangge has not been told about (decision or resolution not delivered). */
+    Set<String> productsWithUndeliveredDecisions() {
+        String sql = """
+                select distinct oi.product_id
+                from channel_orders co
+                join orders o on o.order_id = co.shop_order_id and o.status = 'CONFIRMED'
+                join order_items oi on oi.order_id = o.order_id
+                where (co.decision = 'ACCEPTED' and co.decision_sent = false)
+                   or (co.decision = 'BACKORDERED' and co.resolved = false)
+                """;
+        Set<String> out = new HashSet<>();
+        jdbc.query(sql, rs -> {
+            out.add(rs.getString("product_id"));
+        });
+        return out;
+    }
+
+    /** Units of a product that Tiangge orders still waiting for stock (BACKORDERED) have been promised. */
+    int backorderedUnits(String productId) {
+        Integer n = jdbc.queryForObject(
+                "select coalesce(sum(oi.quantity), 0) from order_items oi "
+                        + "join orders o on o.order_id = oi.order_id "
+                        + "join channel_orders co on co.shop_order_id = o.order_id "
+                        + "where o.status = 'BACKORDERED' and oi.product_id = ?",
+                Integer.class, productId);
+        return n == null ? 0 : n;
+    }
+
+    /**
+     * Units of a product promised to Tiangge orders that are still BACKORDERED and were placed before
+     * the given shop order. Those customers are ahead in the queue for any stock that arrives.
+     */
+    int backorderedUnitsBefore(String productId, long shopOrderId) {
+        Integer n = jdbc.queryForObject(
+                "select coalesce(sum(oi.quantity), 0) from order_items oi "
+                        + "join orders o on o.order_id = oi.order_id "
+                        + "join channel_orders co on co.shop_order_id = o.order_id "
+                        + "where o.status = 'BACKORDERED' and oi.product_id = ? and o.order_id < ?",
+                Integer.class, productId, shopOrderId);
+        return n == null ? 0 : n;
+    }
+
     void markResolved(String id) {
         jdbc.update("update channel_orders set resolved = true where tiangge_order_id = ?", id);
     }
@@ -84,16 +134,9 @@ class ChannelStore {
     }
 
     /**
-     * The stock figure Tiangge should be shown for every product, computed in ONE statement
-     * (so it is one consistent snapshot): our real stock PLUS the units already reserved for
-     * Tiangge orders whose acceptance Tiangge has not been told about yet.
-     * <p>
-     * That is how a stock update can never run ahead of the decision it belongs to
-     * (the manual: "send the update after Tiangge has your decision, not before"),
-     * without coupling the two calls: if the decision is slow or fails, the stock update still goes
-     * out on time, it just still includes those units until the decision has been delivered.
-     * Pending = an ACCEPTED decision not yet sent, or a backorder we have already filled
-     * (order is CONFIRMED) whose resolution has not been sent yet.
+     * The stock figure Tiangge should be shown for every product, computed in ONE statement:
+     * our real stock PLUS the units already reserved for Tiangge orders whose acceptance Tiangge
+     * has not been told about yet.
      */
     Map<String, Integer> publishableStock() {
         String sql = """
@@ -114,11 +157,5 @@ class ChannelStore {
             out.put(rs.getString("product_id"), rs.getInt("available"));
         });
         return out;
-    }
-
-    /** The products on a shop order (used to publish stock for exactly the products an order touched). */
-    List<String> productsOf(long shopOrderId) {
-        return jdbc.queryForList("select distinct product_id from order_items where order_id = ?",
-                String.class, shopOrderId);
     }
 }
