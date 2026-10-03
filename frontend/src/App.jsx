@@ -29,6 +29,7 @@ function App() {
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [cancellingId, setCancellingId] = useState(null)
+  const [orderFilter, setOrderFilter] = useState('')
 
   const refreshAll = async () => {
     const [inv, ord, notif] = await Promise.allSettled([
@@ -199,10 +200,32 @@ function App() {
       <section className="panel">
         <h2>Order History</h2>
         {orders.length === 0 && <p className="empty">No orders yet.</p>}
+        {orders.length > 0 && (
+          <div className="order-history-toolbar">
+            <input
+              type="text"
+              className="order-filter-input"
+              placeholder="Filter by order #, product, or status…"
+              value={orderFilter}
+              onChange={(e) => setOrderFilter(e.target.value)}
+            />
+            <span className="order-count">{orders.length} orders</span>
+          </div>
+        )}
+        <div className="order-history-scroll">
         <ul className="order-history">
           {orders
             .slice()
             .sort((a, b) => b.orderId - a.orderId)
+            .filter((order) => {
+              const q = orderFilter.trim().toLowerCase()
+              if (!q) return true
+              if (String(order.orderId).includes(q)) return true
+              if (order.status.toLowerCase().includes(q)) return true
+              return order.items.some((item) =>
+                productName(item.productId).toLowerCase().includes(q)
+              )
+            })
             .map((order) => (
               <li key={order.orderId} className={`order-row status-${order.status.toLowerCase()}`}>
                 <div className="order-row-header">
@@ -230,6 +253,7 @@ function App() {
               </li>
             ))}
         </ul>
+        </div>
       </section>
 
       <section className="panel">
