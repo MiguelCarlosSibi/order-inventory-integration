@@ -1,5 +1,6 @@
 package edu.cit.sibi.supplier;
 
+import edu.cit.sibi.common.ClientInstance;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -36,6 +37,7 @@ class LegacySupplyClient {
     private final String baseUrl;
     private final String clientId;
     private final String apiKey;
+    private final ClientInstance clientInstance;
 
     // Session state. TODO(Part B): once you've measured how long a session
     // actually lasts, consider proactively refreshing a bit before that
@@ -47,11 +49,13 @@ class LegacySupplyClient {
     LegacySupplyClient(RestTemplate supplierRestTemplate,
                         @Value("${legacysupply.base-url}") String baseUrl,
                         @Value("${legacysupply.client-id}") String clientId,
-                        @Value("${legacysupply.api-key}") String apiKey) {
+                        @Value("${legacysupply.api-key}") String apiKey,
+                        ClientInstance clientInstance) {
         this.restTemplate = supplierRestTemplate;
         this.baseUrl = baseUrl;
         this.clientId = clientId;
         this.apiKey = apiKey;
+        this.clientInstance = clientInstance;
     }
 
     /** GET /ping — needs no session, used for a basic reachability check. */
@@ -162,11 +166,7 @@ class LegacySupplyClient {
                 log.info("Session no longer accepted, re-authenticating and retrying once");
                 sessionToken.set(null);
                 ensureSession();
-                try {
-                    return call.call(sessionToken.get());
-                } catch (LegacySupplySessionExpiredException again) {
-                    throw new LegacySupplyUnavailableException("Session rejected even after re-login: " + again.getMessage());
-                }
+                return call.call(sessionToken.get());
             }
         });
     }
@@ -212,7 +212,9 @@ class LegacySupplyClient {
             return new LegacySupplySessionExpiredException(body);
         }
         if (status.value() == 429) {
-            return new LegacySupplyRateLimitedException("Quota exceeded: " + body, e);
+            // E-RATE-03 - quota exceeded. Deliberately not retried inline;
+            // the PendingReorderRetryJob's own schedule provides the backoff.
+            return new LegacySupplyUnavailableException("Quota exceeded: " + body, e);
         }
         if (status.value() == 503) {
             return new LegacySupplyUnavailableException("LegacySupply unavailable: " + body, e);
@@ -239,6 +241,9 @@ class LegacySupplyClient {
         if (token != null) {
             headers.set("X-LS-Session", token);
         }
+        // Lab 4: same running-instance UUID sent to Tiangge, so both
+        // external systems can tell which copy of this app is calling.
+        headers.set("X-Client-Instance", clientInstance.id());
         return headers;
     }
 

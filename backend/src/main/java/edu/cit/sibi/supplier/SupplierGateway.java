@@ -1,5 +1,7 @@
 package edu.cit.sibi.supplier;
 
+import java.util.Optional;
+
 /**
  * Anti-Corruption Layer entry point for placing replenishment orders with
  * the external LegacySupply system.
@@ -30,4 +32,36 @@ public interface SupplierGateway {
      *         it is never silently dropped
      */
     ReorderResult requestReorder(String productId, int unitsNeeded);
+
+    /**
+     * The LegacySupply SupplierSku we restock the given product from, per
+     * our Lab 3 catalog mapping — needed by Lab 4's Tiangge listings
+     * publisher (Task 2: "Each listing names the LegacySupply SupplierSku
+     * you restock it from"). Empty if we have no mapping for this product.
+     */
+    Optional<String> supplierSkuFor(String productId);
+
+    /**
+     * True if this product has a reorder already placed with LegacySupply
+     * that has not yet been delivered or permanently failed (PENDING,
+     * ACCEPTED, PICKING, or SHIPPED). Used by Lab 4's order-decision logic
+     * to decide BACKORDERED (restock already on its way) vs REJECTED
+     * (nothing coming) when current stock can't cover a Tiangge order.
+     */
+    boolean hasOpenReorder(String productId);
+    /** True only if LegacySupply has actually accepted a purchase order that hasn't been delivered or failed yet. */
+    boolean hasRestockOnTheWay(String productId);
+
+    /**
+     * Places a reorder of at least minUnits unless one is already open.
+     * @return true if a real purchase order is now on its way
+     */
+    boolean ensureRestock(String productId, int minUnits);
+
+    /**
+     * True once our purchase-order statuses have been refreshed from LegacySupply since the app
+     * started. Right after a restart the saved statuses can be stale, and deciding an order
+     * against a stale "restock on the way" would be wrong.
+     */
+    boolean deliveriesUpToDate();
 }

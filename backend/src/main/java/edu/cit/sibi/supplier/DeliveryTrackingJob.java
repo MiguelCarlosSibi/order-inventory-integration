@@ -8,6 +8,14 @@ import org.springframework.stereotype.Component;
 
 import java.util.List;
 
+/**
+ * Part E: polls open purchase orders, maps LegacySupply's StatusCode to our
+ * own {@link SupplierOrderStatus}, and — when an order newly reaches
+ * DELIVERED — publishes {@link SupplierOrderDeliveredEvent} rather than
+ * calling Inventory directly. Inventory listens for that event and
+ * restocks; this job (and the rest of the supplier module) never imports
+ * InventoryService.
+ */
 @Component
 class DeliveryTrackingJob {
 
@@ -18,24 +26,38 @@ class DeliveryTrackingJob {
 
     private final SupplierOrderRepository repository;
     private final LegacySupplyClient client;
-    private final ApplicationEventPublisher eventPublisher;
     private final ProductCatalogMapping catalogMapping;
+    private final ApplicationEventPublisher eventPublisher;
+
+    /** True once one full pass over the open purchase orders has completed since the app started. */
+    private volatile boolean checkedSinceStart = false;
 
     DeliveryTrackingJob(SupplierOrderRepository repository, LegacySupplyClient client,
-                        ApplicationEventPublisher eventPublisher, ProductCatalogMapping catalogMapping) {
+                        ProductCatalogMapping catalogMapping, ApplicationEventPublisher eventPublisher) {
         this.repository = repository;
         this.client = client;
-        this.eventPublisher = eventPublisher;
         this.catalogMapping = catalogMapping;
+        this.eventPublisher = eventPublisher;
     }
 
-    @Scheduled(fixedDelayString = "${supplier.reorder.delivery-poll-interval-ms:60000}")
+    /**
+     * After a restart our saved purchase-order statuses can be stale (LegacySupply keeps delivering
+     * while the app is off). Order decisions wait for this to turn true so we never backorder
+     * against a purchase order that has in fact already been delivered.
+     */
+    boolean checkedSinceStart() {
+        return checkedSinceStart;
+    }
+
+    @Scheduled(fixedDelayString = "${supplier.reorder.delivery-poll-interval-ms:30000}")
     void pollOpenOrders() {
         List<SupplierOrder> open = repository.findByStatusIn(OPEN_STATUSES);
         if (open.isEmpty()) {
+            checkedSinceStart = true;
             return;
         }
         log.info("Polling {} open supplier order(s)", open.size());
+        boolean allChecked = true;
 
         for (SupplierOrder order : open) {
             try {
@@ -44,28 +66,35 @@ class DeliveryTrackingJob {
                 SupplierOrderStatus previousStatus = order.getStatus();
 
                 if (newStatus != previousStatus) {
-                    if (newStatus == SupplierOrderStatus.DELIVERED) {
-                        // Publish BEFORE saving: if the restock fails, the order stays open and is retried next poll.
-                        int unitsDelivered = catalogMapping.casesToUnits(order.getProductId(), order.getCases());
-                        eventPublisher.publishEvent(new SupplierOrderDeliveredEvent(
-                                order.getProductId(), unitsDelivered, order.getId()));
-                    }
                     order.setStatus(newStatus);
                     repository.save(order);
                     log.info("Order {} ({}): {} -> {}", order.getBuyerRef(), order.getPoNumber(), previousStatus, newStatus);
+
+                    if (newStatus == SupplierOrderStatus.DELIVERED) {
+                        // Publish the units LegacySupply actually shipped
+                        // (cases x PackSize), not the units originally
+                        // requested — a rounded-up order ships a full case,
+                        // so this can be more than what was asked for.
+                        int unitsShipped = catalogMapping.casesToUnits(order.getProductId(), order.getCases());
+                        eventPublisher.publishEvent(new SupplierOrderDeliveredEvent(
+                                order.getProductId(), unitsShipped, order.getId()));
+                    }
                 }
-            } catch (LegacySupplyRateLimitedException e) {
-                log.warn("Quota hit while polling, stopping this cycle: {}", e.getMessage());
-                return;
             } catch (LegacySupplyUnavailableException e) {
+                // Transient - this order stays at its current status and
+                // gets picked up again on the next poll.
+                allChecked = false;
                 log.warn("Could not check status for {}: {}", order.getBuyerRef(), e.getMessage());
             } catch (LegacySupplyRejectedException e) {
+                // The order itself was rejected/not found on LegacySupply's
+                // side after the fact - flag it rather than poll forever.
                 order.setStatus(SupplierOrderStatus.FAILED);
                 repository.save(order);
                 log.error("Order {} ({}) now permanently failed: {}", order.getBuyerRef(), order.getPoNumber(), e.getMessage());
-            } catch (RuntimeException e) {
-                log.error("Unexpected error tracking {}", order.getBuyerRef(), e);
             }
+        }
+        if (allChecked) {
+            checkedSinceStart = true;
         }
     }
 }

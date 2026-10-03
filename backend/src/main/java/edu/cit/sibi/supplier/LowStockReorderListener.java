@@ -3,24 +3,18 @@ package edu.cit.sibi.supplier;
 import edu.cit.sibi.shop.event.LowStockEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.event.EventListener;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 /**
- * Lab 2's auto-reorder rule only logged "reorder needed" (see
- * NotificationEventListener, which still does that — unchanged). Lab 3
- * adds this listener alongside it to actually place a purchase order.
- * <p>
- * This listener lives in the supplier module (not shop or inventory)
- * specifically so that neither of those modules needs to import anything
- * from edu.cit.sibi.supplier at all, satisfying the rule that "Order and
- * Inventory modules must not import anything that describes LegacySupply"
- * as literally as possible — they don't import the supplier package in
- * any form. The only cross-module import here is LowStockEvent, the same
- * "depend on event classes only" pattern Notification already uses.
+ * Lab 3's auto-reorder, now run after the order transaction commits and on
+ * its own thread, so a slow or failing LegacySupply never delays a customer
+ * order (this is what INTEGRATION.md describes). Skips products that already
+ * have an open reorder.
  */
 @Component
 class LowStockReorderListener {
@@ -28,28 +22,31 @@ class LowStockReorderListener {
     private static final Logger log = LoggerFactory.getLogger(LowStockReorderListener.class);
 
     private final SupplierGateway supplierGateway;
+    private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "low-stock-reorder");
+        t.setDaemon(true);
+        return t;
+    });
 
     LowStockReorderListener(SupplierGateway supplierGateway) {
         this.supplierGateway = supplierGateway;
     }
 
-    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
-    @Async
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
     void onLowStock(LowStockEvent event) {
         // Reorder policy: bring stock back up to double the threshold.
-        // Simple and documented here rather than configurable — adjust if
-        // your instructor wants a different rule, and note the choice in
-        // INTEGRATION.md.
-        int targetStock = event.threshold() * 2;
-        int unitsNeeded = targetStock - event.currentStock();
+        int unitsNeeded = event.threshold() * 2 - event.currentStock();
         if (unitsNeeded <= 0) {
             return;
         }
-
-        log.info("Low stock on {} ({} left, threshold {}) - requesting reorder of {} units",
-                event.productId(), event.currentStock(), event.threshold(), unitsNeeded);
-        ReorderResult result = supplierGateway.requestReorder(event.productId(), unitsNeeded);
-        log.info("Reorder {} for {}: status={}, poNumber={}",
-                result.buyerRef(), event.productId(), result.status(), result.poNumber());
+        executor.submit(() -> {
+            try {
+                log.info("Low stock on {} ({} left, threshold {}) - ensuring a reorder of {} units",
+                        event.productId(), event.currentStock(), event.threshold(), unitsNeeded);
+                supplierGateway.ensureRestock(event.productId(), unitsNeeded);
+            } catch (RuntimeException e) {
+                log.warn("Low-stock reorder for {} failed: {}", event.productId(), e.getMessage());
+            }
+        });
     }
 }

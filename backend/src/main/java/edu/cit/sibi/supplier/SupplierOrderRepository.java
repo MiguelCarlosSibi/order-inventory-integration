@@ -15,4 +15,7 @@ interface SupplierOrderRepository extends JpaRepository<SupplierOrder, Long> {
 
     /** Orders still being tracked — anything short of a terminal state. */
     List<SupplierOrder> findByStatusIn(List<SupplierOrderStatus> statuses);
+
+    /** Same, scoped to one product — used for Lab 4's backorder check. */
+    boolean existsByProductIdAndStatusIn(String productId, List<SupplierOrderStatus> statuses);
 }

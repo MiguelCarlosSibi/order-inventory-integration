@@ -12,6 +12,7 @@ import edu.cit.sibi.shop.event.OrderPlacedEvent;
 import edu.cit.sibi.shop.event.OrderRejectedEvent;
 import edu.cit.sibi.shop.exception.OrderAlreadyCancelledException;
 import edu.cit.sibi.shop.exception.OrderNotFoundException;
+import edu.cit.sibi.shop.exception.StockChangedException;
 import edu.cit.sibi.shop.model.Order;
 import edu.cit.sibi.shop.model.OrderItem;
 import edu.cit.sibi.shop.model.OrderStatus;
@@ -19,23 +20,18 @@ import edu.cit.sibi.shop.repository.OrderRepository;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Predicate;
 
 /**
- * Calls InventoryService in-process (plain Java method calls, no network
- * hop) to place and cancel orders. Only ever depends on the InventoryService
- * interface — see InventoryServiceImpl for why that's enforced by the
- * compiler, not just convention.
- *
- * Also publishes domain events (OrderPlacedEvent / OrderRejectedEvent /
- * LowStockEvent) via Spring's ApplicationEventPublisher instead of calling
- * the Notification module directly. OrderService has no import from
- * edu.cit.sibi.notification anywhere in this file — Notification finds out
- * about orders purely by listening for these events.
+ * Order logic. Knows nothing about any sales channel: orders from the React
+ * UI and from external channels go through exactly the same methods.
  */
 @Service
 public class OrderService {
@@ -46,52 +42,79 @@ public class OrderService {
     private final InventoryService inventoryService;
     private final OrderRepository orderRepository;
     private final ApplicationEventPublisher eventPublisher;
+    private final TransactionTemplate tx;
 
     public OrderService(InventoryService inventoryService,
-                         OrderRepository orderRepository,
-                         ApplicationEventPublisher eventPublisher) {
+                        OrderRepository orderRepository,
+                        ApplicationEventPublisher eventPublisher,
+                        TransactionTemplate tx) {
         this.inventoryService = inventoryService;
         this.orderRepository = orderRepository;
         this.eventPublisher = eventPublisher;
+        this.tx = tx;
     }
 
-    @Transactional
-    public OrderResponse placeOrder(List<OrderItemRequest> requestedItems) {
-        // Phase 1: validate every line item WITHOUT reserving anything.
-        // All-or-nothing: if any single item would fail, the whole order is
-        // rejected before a single unit of stock is touched.
+    /** Used by the React UI: no restock is assumed, so a shortage means REJECTED. */
+    public OrderResponse placeOrder(List<OrderItemRequest> items) {
+        return placeOrder(items, productId -> false);
+    }
+
+    /**
+     * restockComing says whether a product already has a restock on its way.
+     * If every short product does, the order becomes BACKORDERED, not REJECTED.
+     */
+    public OrderResponse placeOrder(List<OrderItemRequest> items, Predicate<String> restockComing) {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            // The caller owns the transaction and its retry; join it.
+            return doPlaceOrder(items, restockComing);
+        }
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return tx.execute(status -> doPlaceOrder(items, restockComing));
+            } catch (StockChangedException e) {
+                // Stock moved between check and reserve; the transaction rolled back.
+                // Retrying re-checks stock, so it ends in a proper accept or reject.
+                if (attempt >= 3) {
+                    throw e;
+                }
+            }
+        }
+    }
+
+    private OrderResponse doPlaceOrder(List<OrderItemRequest> requestedItems, Predicate<String> restockComing) {
         Map<String, ReservationResult> checks = new LinkedHashMap<>();
         boolean allOk = true;
+        boolean canBackorder = true;
         for (OrderItemRequest item : requestedItems) {
             ReservationResult check = inventoryService.checkAvailability(item.productId(), item.quantity());
             checks.put(item.productId(), check);
             if (!check.success()) {
                 allOk = false;
+                boolean knownProduct = check.item() != null;
+                if (!knownProduct || !restockComing.test(item.productId())) {
+                    canBackorder = false;
+                }
             }
         }
 
         if (!allOk) {
-            return rejectOrder(requestedItems, checks);
+            return canBackorder ? backorderOrder(requestedItems) : rejectOrder(requestedItems, checks);
         }
 
-        // Phase 2: every item passed validation — now actually reserve each
-        // one. Still inside the same @Transactional method/DB transaction
-        // as the order-row insert below, so a failure partway through rolls
-        // the whole thing back at the database level too.
         List<OrderItemResult> itemResults = new ArrayList<>();
         List<InventoryItem> updatedInventory = new ArrayList<>();
-
         Order order = new Order(OrderStatus.CONFIRMED, null);
         for (OrderItemRequest item : requestedItems) {
             ReservationResult result = inventoryService.reserve(item.productId(), item.quantity());
-            // result.success() is expected true here since we just validated
-            // it — but if a concurrent request changed stock in between,
-            // this could still fail. Not resolved in this lab; see README.
+            if (!result.success()) {
+                // Rolls back every reserve made so far in this order.
+                throw new StockChangedException(item.productId());
+            }
             order.addItem(new OrderItem(item.productId(), item.quantity(), "OK"));
             itemResults.add(new OrderItemResult(item.productId(), item.quantity(), "OK"));
             updatedInventory.add(result.item());
 
-            if (result.item() != null && result.item().stock() < LOW_STOCK_THRESHOLD) {
+            if (result.item().stock() < LOW_STOCK_THRESHOLD) {
                 eventPublisher.publishEvent(
                         new LowStockEvent(result.item().productId(), result.item().stock(), LOW_STOCK_THRESHOLD));
             }
@@ -99,8 +122,19 @@ public class OrderService {
 
         Order saved = orderRepository.save(order);
         eventPublisher.publishEvent(new OrderPlacedEvent(saved.getOrderId()));
-
         return new OrderResponse(saved.getOrderId(), OrderStatus.CONFIRMED.name(), null, itemResults, updatedInventory);
+    }
+
+    private OrderResponse backorderOrder(List<OrderItemRequest> items) {
+        Order order = new Order(OrderStatus.BACKORDERED, "Waiting for restock");
+        List<OrderItemResult> results = new ArrayList<>();
+        for (OrderItemRequest item : items) {
+            order.addItem(new OrderItem(item.productId(), item.quantity(), "BACKORDERED"));
+            results.add(new OrderItemResult(item.productId(), item.quantity(), "BACKORDERED"));
+        }
+        Order saved = orderRepository.save(order);
+        return new OrderResponse(saved.getOrderId(), OrderStatus.BACKORDERED.name(),
+                "Waiting for restock", results, List.of());
     }
 
     private OrderResponse rejectOrder(List<OrderItemRequest> requestedItems, Map<String, ReservationResult> checks) {
@@ -129,6 +163,69 @@ public class OrderService {
         return new OrderResponse(saved.getOrderId(), OrderStatus.REJECTED.name(), firstFailureReason, itemResults, snapshot);
     }
 
+    /** Backordered orders waiting for stock, oldest first. */
+    public List<Long> backorderedOrderIds() {
+        return orderRepository.findByStatusOrderByCreatedAtAsc(OrderStatus.BACKORDERED)
+                .stream().map(Order::getOrderId).toList();
+    }
+
+    /**
+     * Tries to fill a backorder. Returns the order's status afterward:
+     * CONFIRMED if it was filled, BACKORDERED if stock is still short.
+     */
+    @Transactional
+    public OrderStatus fulfilBackorder(Long orderId) {
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
+        if (order.getStatus() != OrderStatus.BACKORDERED) {
+            return order.getStatus();
+        }
+
+        for (OrderItem item : order.getItems()) {
+            if (!inventoryService.checkAvailability(item.getProductId(), item.getQuantity()).success()) {
+                return OrderStatus.BACKORDERED;
+            }
+        }
+        for (OrderItem item : order.getItems()) {
+            if (!inventoryService.reserve(item.getProductId(), item.getQuantity()).success()) {
+                throw new StockChangedException(item.getProductId());
+            }
+        }
+        order.setStatus(OrderStatus.CONFIRMED);
+        order.setReason(null);
+        orderRepository.save(order);
+        eventPublisher.publishEvent(new OrderPlacedEvent(order.getOrderId()));
+        return OrderStatus.CONFIRMED;
+    }
+    /** Products on this order that currently lack enough stock. */
+    @Transactional(readOnly = true)
+    public List<String> shortProducts(Long orderId) {
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
+        List<String> out = new ArrayList<>();
+        for (OrderItem item : order.getItems()) {
+            if (!inventoryService.checkAvailability(item.getProductId(), item.getQuantity()).success()) {
+                out.add(item.getProductId());
+            }
+        }
+        return out;
+    }
+
+    @Transactional(readOnly = true)
+    public Map<String, Integer> requiredUnits(Long orderId) {
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
+        Map<String, Integer> out = new LinkedHashMap<>();
+        for (OrderItem item : order.getItems()) {
+            out.merge(item.getProductId(), item.getQuantity(), Integer::sum);
+        }
+        return out;
+    }
+    /**
+     * One transaction: every restock and the CANCELLED status commit together. Without it each
+     * restock committed on its own while the order still read CONFIRMED, so a stock figure computed
+     * in that gap counted the units twice (real stock + "pending" units of the same order).
+     */
     @Transactional
     public CancelResponseHolder cancelOrder(Long orderId) {
         Order order = orderRepository.findById(orderId)
@@ -139,8 +236,8 @@ public class OrderService {
         }
 
         List<InventoryItem> restocked = new ArrayList<>();
-        // Only CONFIRMED orders actually reserved stock; a REJECTED order
-        // never touched inventory, so cancelling one just flips its status.
+        // Only CONFIRMED orders actually reserved stock. REJECTED and
+        // BACKORDERED orders never did, so cancelling them restocks nothing.
         if (order.getStatus() == OrderStatus.CONFIRMED) {
             for (OrderItem item : order.getItems()) {
                 InventoryItem updated = inventoryService.restock(item.getProductId(), item.getQuantity());

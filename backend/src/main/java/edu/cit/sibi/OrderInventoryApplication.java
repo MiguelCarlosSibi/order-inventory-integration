@@ -2,7 +2,6 @@ package edu.cit.sibi;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
@@ -13,7 +12,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  * DeliveryTrackingJob).
  */
 @SpringBootApplication
-@EnableScheduling @EnableAsync
+@EnableScheduling
 public class OrderInventoryApplication {
 
     public static void main(String[] args) {

@@ -31,6 +31,22 @@ class ProductCatalogMapping {
     }
 
     /**
+     * Converts cases actually shipped by LegacySupply back into our own
+     * units, for use when a delivery is confirmed (Part E). This is the
+     * inverse of {@link #unitsToCases}: since ordering always rounds UP to
+     * a whole case, the units actually delivered are >= the units
+     * originally requested — e.g. requesting 8 units at PackSize 24 sends
+     * Qty 1, and LegacySupply ships the full case: 24 units, not 8.
+     */
+    int casesToUnits(String productId, int cases) {
+        Mapping mapping = MAPPINGS.get(productId);
+        if (mapping == null) {
+            throw new IllegalArgumentException("No LegacySupply mapping for product " + productId);
+        }
+        return cases * Math.max(1, mapping.packSize());
+    }
+
+    /**
      * Converts a units-needed figure to whole LegacySupply cases, rounding
      * up — the ACL's unit conversion, per Part C ("rounding up").
      */
@@ -41,14 +57,5 @@ class ProductCatalogMapping {
         }
         int packSize = Math.max(1, mapping.packSize());
         return (units + packSize - 1) / packSize; // ceiling division
-    }
-
-    /** Units that physically arrive when this many cases are delivered. */
-    int casesToUnits(String productId, int cases) {
-        Mapping mapping = MAPPINGS.get(productId);
-        if (mapping == null) {
-            throw new IllegalArgumentException("No LegacySupply mapping for product " + productId);
-        }
-        return cases * Math.max(1, mapping.packSize());
     }
 }
