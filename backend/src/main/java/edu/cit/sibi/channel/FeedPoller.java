@@ -3,6 +3,7 @@ package edu.cit.sibi.channel;
 import edu.cit.sibi.channel.ChannelStore.ChannelOrder;
 import edu.cit.sibi.inventory.InventoryService;
 import edu.cit.sibi.inventory.dto.ReservationResult;
+import java.util.concurrent.ConcurrentHashMap;
 import edu.cit.sibi.shop.dto.OrderItemRequest;
 import edu.cit.sibi.shop.dto.OrderResponse;
 import edu.cit.sibi.shop.exception.OrderAlreadyCancelledException;
@@ -61,7 +62,8 @@ class FeedPoller {
      * so two orders can never count the same incoming units. Never held during a supplier or Tiangge call.
      */
     private final ReentrantLock placeLock = new ReentrantLock();
-
+    /** Cancellations whose confirmation is still pending: their stock hold stays until Tiangge confirms. */
+    private final Map<String, Set<String>> cancelHeld = new ConcurrentHashMap<>();
     private final TiangeClient client;
     private final ChannelStore store;
     private final OrderService orderService;
@@ -463,45 +465,53 @@ class FeedPoller {
             sendDecision(tid);
         }
 
-        // The manual: confirm FIRST, then publish the restocked figure. The restock below would
-        // publish on its own the moment it commits, so hold stock for these products until confirmed.
-        Set<String> heldProducts = new java.util.HashSet<>();
-        try {
-            heldProducts.addAll(orderService.requiredUnits(co.shopOrderId()).keySet());
-        } catch (RuntimeException ignored) {
-            // unknown order: cancelOrder below reports it
-        }
-        stockSync.holdPublishing(heldProducts);
-        try {
+        // The manual: confirm FIRST, then publish the restocked figure. Hold stock for these
+        // products until Tiangge has confirmed. On a replay the hold already exists: never hold twice.
+        Set<String> heldProducts = cancelHeld.get(tid);
+        if (heldProducts == null) {
+            heldProducts = new java.util.HashSet<>();
             try {
-                // Restocks Inventory (its InventoryChangedEvent is held back until the confirmation is done).
-                orderService.cancelOrder(co.shopOrderId());
-            } catch (OrderAlreadyCancelledException alreadyDone) {
-                // a retry after a failed confirmation: the restock already happened
+                heldProducts.addAll(orderService.requiredUnits(co.shopOrderId()).keySet());
+            } catch (RuntimeException e) {
+                log.info("DIAG cancel order={} shopOrder={} could not read requiredUnits: {}",
+                        tid, co.shopOrderId(), e.getMessage());
             }
-            boolean settled = false;
-            try {
-                client.confirmCancellation(tid);
-                settled = true;
-            } catch (HttpClientErrorException e) {
-                int code = e.getStatusCode().value();
-                if (code == 409 || code == 404) {
-                    settled = true;   // e.g. a timed-out first attempt that Tiangge did process
-                    log.warn("Tiangge answered {} to the cancellation confirmation of {}; treating it as settled: {}",
-                            code, tid, e.getResponseBodyAsString());
-                } else {
-                    log.error("Tiangge refused the cancellation confirmation for {}: {}", tid, e.getResponseBodyAsString());
-                }
-            }
-            if (settled) {
-                store.markCancelConfirmed(tid);
-                long seconds = Duration.between(Instant.parse(ev.cancelledAt()), Instant.now()).toSeconds();
-                log.info("Cancellation of {} confirmed {} s after the customer cancelled", tid, seconds);
-            }
-        } finally {
-            // Runs on EVERY path: release the hold, then publish the restocked figure.
-            stockSync.releasePublishing(heldProducts);
-            stockSync.publishAll();
+            log.info("DIAG cancel order={} shopOrder={} heldProducts={}", tid, co.shopOrderId(), heldProducts);
+            stockSync.holdPublishing(heldProducts);
+            cancelHeld.put(tid, heldProducts);
         }
+
+        try {
+            // Restocks Inventory (its InventoryChangedEvent is held back while the embargo is on).
+            orderService.cancelOrder(co.shopOrderId());
+        } catch (OrderAlreadyCancelledException alreadyDone) {
+            // a replay: the restock already happened
+        }
+
+        try {
+            client.confirmCancellation(tid);
+        } catch (HttpClientErrorException e) {
+            int code = e.getStatusCode().value();
+            if (code != 409 && code != 404) {
+                // Permanent refusal: retrying can never help and would block the whole feed page.
+                log.error("Tiangge refused the cancellation confirmation for {}: {}", tid, e.getResponseBodyAsString());
+                cancelHeld.remove(tid);
+                stockSync.releasePublishing(heldProducts);
+                stockSync.publishAll();
+                return;
+            }
+            // 409/404, e.g. a timed-out first attempt that Tiangge did process: settled.
+            log.warn("Tiangge answered {} to the cancellation confirmation of {}; treating it as settled: {}",
+                    code, tid, e.getResponseBodyAsString());
+        }
+        // Timeouts and 5xx are NOT caught: they propagate, the event is replayed on the next poll,
+        // and the stock hold stays in place. Only a confirmed cancellation reaches the lines below.
+
+        store.markCancelConfirmed(tid);
+        long seconds = Duration.between(Instant.parse(ev.cancelledAt()), Instant.now()).toSeconds();
+        log.info("Cancellation of {} confirmed {} s after the customer cancelled", tid, seconds);
+        cancelHeld.remove(tid);
+        stockSync.releasePublishing(heldProducts);
+        stockSync.publishAll();
     }
 }

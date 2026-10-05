@@ -41,7 +41,7 @@ class HeartbeatScheduler {
     @Order(1)
     void sendFirstHeartbeat() {
         beat();
-        beats.scheduleWithFixedDelay(this::beat, 5, 5, TimeUnit.SECONDS);
+        beats.scheduleAtFixedRate(this::beat, 3, 3, TimeUnit.SECONDS);
     }
 
     private void beat() {

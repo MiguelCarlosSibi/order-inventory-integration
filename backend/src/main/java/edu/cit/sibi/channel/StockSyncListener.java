@@ -93,6 +93,7 @@ class StockSyncListener {
 
     private void publish(Collection<String> productIds) {
         dirty.addAll(productIds);
+        log.info("DIAG stock-publish-request products={} dirtyNow={}", productIds, dirty);
         requestFlush();
     }
 
@@ -133,12 +134,16 @@ class StockSyncListener {
             List<String> sendable = new ArrayList<>();
             for (String id : ids) {
                 if (unsure.contains(id) || embargo.containsKey(id)) {
-                    dirty.add(id);   // retried automatically once it is safe
+                    dirty.add(id);
+                    log.info("DIAG stock-defer product={} ambiguous={} embargoed={} embargoCount={}",
+                            id, unsure.contains(id), embargo.containsKey(id), embargo.get(id));
                 } else {
                     sendable.add(id);
                 }
             }
             if (sendable.isEmpty()) {
+                log.info("DIAG stock-flush produced nothing sendable, ids={} unsure={} embargoed={}",
+                        ids, unsure, embargo.keySet());
                 return;
             }
 
@@ -227,13 +232,15 @@ class StockSyncListener {
     /** While held, no stock figure for these products goes out (the cancellation must be confirmed first). */
     void holdPublishing(Collection<String> productIds) {
         for (String id : productIds) {
-            embargo.merge(id, 1, Integer::sum);
+            int now = embargo.merge(id, 1, Integer::sum);
+            log.info("DIAG embargo-hold product={} count={}", id, now);
         }
     }
 
     void releasePublishing(Collection<String> productIds) {
         for (String id : productIds) {
             embargo.computeIfPresent(id, (k, v) -> v <= 1 ? null : v - 1);
+            log.info("DIAG embargo-release product={} countAfter={}", id, embargo.get(id));
         }
     }
 
@@ -305,7 +312,10 @@ class StockSyncListener {
             boolean reserved = false;
             List<Lock> held = acquire(need.keySet(), false);
             try {
-                if (!reserveView(need)) {
+                boolean ok = reserveView(need);
+                log.info("DIAG sendAcceptance order={} need={} reserveViewOk={} attempt={}/3",
+                        orderKey, need, ok, attempt);
+                if (!ok) {
                     needsFreshFigure = true;
                 } else {
                     reserved = true;

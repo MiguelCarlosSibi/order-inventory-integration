@@ -126,7 +126,8 @@ class SupplierGatewayImpl implements SupplierGateway {
 
     @Override
     public int inboundUnits(String productId) {
-        return unitsOf(productId, ON_THE_WAY);
+        // Pending reorders count: they are being (re)sent right now and are what ensureSupply planned for.
+        return unitsOf(productId, OPEN_STATUSES);
     }
 
     @Override
